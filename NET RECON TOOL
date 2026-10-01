@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+recon_final_ready.py
+
+All-in-one recon + HTTP enumeration + safe non-destructive vulnerability triage.
+Prompts before each major stage unless --yes or auto_confirm in config.
+
+Save as recon_final_ready.py and run:
+  Interactive: python recon_final_ready.py
+  Non-interactive config: python recon_final_ready.py --config config.json
+  Non-interactive CLI: python recon_final_ready.py --target 192.168.1.1 --ports 1-1024 --yes
+
+Only run on systems you own or have permission to test.
+"""
+import socket, ssl, json, csv, time, sys, re, os, argparse
+from datetime import datetime
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+# optional requests for NVD/HTTP
+try:
+    import requests
+    REQUESTS_OK = True
+except Exception:
+    REQUESTS_OK = False
+
+# ---------------- Defaults (phone-friendly) ----------------
+DEFAULT_THREADS = 8           # lowered for phone/router friendliness
+CONNECT_TIMEOUT = 1.5
+READ_TIMEOUT = 1.0
+BANNER_BYTES = 2048
+SAVE_REPORTS = True
+COMMON_SWEEP_PORTS = [80, 443, 22]
+# -----------------------------------------------------------
+
+HTTP_ADMIN_PATHS = ["/admin", "/login", "/wp-admin", "/phpmyadmin", "/manager/html"]
+SERVICE_HINTS = [
+    ("ssh", ["ssh-"]),
+    ("http", ["http/", "server:", "<html", "get /", "post /"]),
+    ("smtp", ["esmtp", "smtp"]),
+    ("ftp", ["vsftpd", "ftp", "proftpd"]),
+    ("mysql", ["mysql", "mariadb"]),
+    ("upnp", ["upnp", "ssdp", "rootdevice"]),
+    ("smb", ["samba", "microsoft-ds", "smb"]),
+    ("rdp", ["rdp", "3389"]),
+    ("vnc", ["rfb", "vnc"]),
+]
+
+def now_str(): return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def parse_port_input(s):
+    s = (s or "").strip()
+    if not s: return []
+    parts = s.split(","); out=set()
+    for p in parts:
+        p=p.strip()
+        if "-" in p:
+            try:
+                a,b = p.split("-",1); a,b=int(a),int(b)
+                if a<1: a=1
+                if b>65535: b=65535
+                for x in range(a,b+1): out.add(x)
+            except: pass
+        else:
+            try:
+                v=int(p)
+                if 1<=v<=65535: out.add(v)
+            except: pass
+    return sorted(out)
+
+def parse_host_input(host_input):
+    host_input = (host_input or "").strip()
+    if "," in host_input:
+        return [h.strip() for h in host_input.split(",") if h.strip()]
+    if host_input.endswith("."):
+        start = input("Start last octet (1): ").strip() or "1"
+        end = input("End last octet (254): ").strip() or "254"
+        try:
+            a=int(start); b=int(end)
+            return [f"{host_input}{i}" for i in range(a,b+1)]
+        except: return []
+    return [host_input]
+
+# ---------- Host discovery ----------
+def test_connect(ip, port, timeout=CONNECT_TIMEOUT):
+    s=socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(timeout)
+    try: s.connect((ip,port)); s.close(); return True, ip, port, None
+    except Exception as e: return False, ip, port, str(e)
+
+def tcp_sweep(hosts, probe_ports=None, threads=DEFAULT_THREADS):
+    if probe_ports is None: probe_ports = COMMON_SWEEP_PORTS
+    live=set()
+    print(f"\n[*] Host discovery: probing {len(hosts)} hosts on ports {probe_ports} (threads={threads})")
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures={pool.submit(test_connect,h,p):(h,p) for h in hosts for p in probe_ports}
+        for fut in as_completed(futures):
+            ok, ip, port, err = fut.result()
+            if ok:
+                if ip not in live: print(f"[+] Host up: {ip} (accepted connection on port {port})")
+                live.add(ip)
+    return sorted(list(live))
+
+# ---------- Banner/probe/TLS helpers ----------
+def recv_some(s, timeout=READ_TIMEOUT, size=BANNER_BYTES):
+    s.settimeout(timeout)
+    try:
+        data = s.recv(size)
+        return data.decode(errors="ignore").strip() if data else ""
+    except Exception:
+        return ""
+
+def inspect_tls(host, port=443, timeout=4.0):
+    info={"ok":False,"error":None,"cert":None}
+    try:
+        ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+        with socket.create_connection((host,port), timeout=timeout) as sock:
+            with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                cert = ss.getpeercert()
+                parsed={}
+                subj = cert.get("subject",()); cn=None
+                for item in subj:
+                    for k,v in item:
+                        if k.lower()=="commonname": cn=v
+                parsed["commonName"]=cn
+                san = cert.get("subjectAltName",()); parsed["SANs"]=[v for k,v in san if k.lower() in ("dns","ip")]
+                issuer = cert.get("issuer",()); issuer_cn=None
+                for item in issuer:
+                    for k,v in item:
+                        if k.lower()=="commonname": issuer_cn=v
+                parsed["issuerCN"]=issuer_cn
+                parsed["notBefore"]=cert.get("notBefore"); parsed["notAfter"]=cert.get("notAfter")
+                days_left=None
+                try:
+                    if parsed["notAfter"]:
+                        from datetime import datetime
+                        try: dt=datetime.strptime(parsed["notAfter"], "%b %d %H:%M:%S %Y %Z")
+                        except:
+                            try: dt=datetime.strptime(parsed["notAfter"], "%Y%m%d%H%M%SZ")
+                            except: dt=None
+                        if dt: days_left=(dt-datetime.utcnow()).days
+                except: days_left=None
+                parsed["days_until_expiry"]=days_left
+                info["ok"]=True; info["cert"]=parsed
+    except Exception as e:
+        info["error"]=str(e)
+    return info
+
+def detect_service_from_text(text):
+    if not text: return "unknown"
+    t=text.lower()
+    for name,keys in SERVICE_HINTS:
+        for k in keys:
+            if k in t: return name
+    if "apache" in t or "nginx" in t: return "http"
+    return "unknown"
+
+# ---------- Port probe ----------
+def probe_port(host, port, conn_timeout=CONNECT_TIMEOUT, read_timeout=READ_TIMEOUT):
+    out={"host":host,"port":port,"open":False,"banner":"","probe":"","service":"","tls":None,"error":None,"time":0.0}
+    t0=time.time()
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM); s.settimeout(conn_timeout)
+    try:
+        s.connect((host, port)); out["open"]=True
+        out["banner"] = recv_some(s, timeout=read_timeout, size=BANNER_BYTES)
+        if port in (80,8080,8000):
+            try:
+                req=f"GET / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                s.sendall(req.encode()); out["probe"]=recv_some(s, timeout=read_timeout, size=BANNER_BYTES)
+            except Exception as e: out["probe"]=f"HTTP probe error: {e}"
+        if port in (443,8443):
+            out["tls"]=inspect_tls(host,port); out["probe"]=out["probe"] or "(HTTPS - TLS handshake performed)"
+        if port==22 and not out["banner"]:
+            out["banner"]=recv_some(s, timeout=1.0, size=512)
+        if port==25:
+            try: s.sendall(b"EHLO example.com\r\n"); out["probe"]=recv_some(s, timeout=read_timeout, size=1024)
+            except Exception as e: out["probe"]=f"SMTP probe error: {e}"
+        if not out["banner"] and not out["probe"]:
+            out["banner"]=recv_some(s, timeout=0.5, size=512)
+        combined = (out["banner"] or "") + "\n" + (out["probe"] or "")
+        out["service"] = detect_service_from_text(combined)
+    except Exception as e:
+        out["error"]=str(e)
+    finally:
+        try: s.close()
+        except: pass
+        out["time"] = time.time() - t0
+        return out
+
+# ---------- HTTP enumeration ----------
+def http_get_raw(host, port=80, use_tls=False, timeout=3.0):
+    try:
+        data=b""
+        if use_tls:
+            ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                    req=f"GET / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                    ss.sendall(req.encode())
+                    while True:
+                        part=ss.recv(2048)
+                        if not part: break
+                        data+=part
+        else:
+            with socket.create_connection((host, port), timeout=timeout) as sock:
+                req=f"GET / HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                sock.sendall(req.encode())
+                while True:
+                    part=sock.recv(2048)
+                    if not part: break
+                    data+=part
+        text = data.decode(errors="ignore")
+        if "\r\n\r\n" in text:
+            head, body = text.split("\r\n\r\n",1)
+        else:
+            head, body = text, ""
+        first_line = head.splitlines()[0] if head.splitlines() else ""
+        status = first_line.strip()
+        headers={}
+        for line in head.splitlines()[1:]:
+            if ":" in line:
+                k,v=line.split(":",1); headers[k.strip()]=v.strip()
+        return status, headers, body
+    except Exception as e:
+        return None, {"error":str(e)}, ""
+
+def enumerate_http_service(host, port, tls_info=None):
+    use_tls = port in (443,8443) or (tls_info and tls_info.get("ok"))
+    findings={"host":host,"port":port,"use_tls":use_tls,"root_status":None,"root_headers":None,"root_title":None,"robots":None,"admin_paths":{},"server_header":None,"x_powered_by":None}
+    status, headers, body = http_get_raw(host, port, use_tls=use_tls)
+    findings["root_status"]=status; findings["root_headers"]=headers
+    if isinstance(headers, dict):
+        findings["server_header"]=headers.get("Server") or headers.get("server")
+        findings["x_powered_by"]=headers.get("X-Powered-By") or headers.get("x-powered-by")
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+    if m: findings["root_title"]=m.group(1).strip()
+    try:
+        status_r, headers_r, body_r = http_get_raw(host, port, use_tls=use_tls, timeout=2.5)
+        if body_r and ("User-agent" in body_r or "Disallow" in body_r or "robots" in body_r.lower()):
+            findings["robots"]=body_r.strip().splitlines()[:200]
+    except Exception:
+        findings["robots"]=None
+    for p in HTTP_ADMIN_PATHS:
+        try:
+            path_req = p if p.startswith("/") else "/" + p
+            if use_tls:
+                ctx=ssl.create_default_context(); ctx.check_hostname=False; ctx.verify_mode=ssl.CERT_NONE
+                with socket.create_connection((host, port), timeout=3.0) as sock:
+                    with ctx.wrap_socket(sock, server_hostname=host) as ss:
+                        req=f"GET {path_req} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                        ss.sendall(req.encode()); data=b""
+                        while True:
+                            part=ss.recv(2048)
+                            if not part: break
+                            data+=part
+            else:
+                with socket.create_connection((host, port), timeout=3.0) as sock:
+                    req=f"GET {path_req} HTTP/1.0\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                    sock.sendall(req.encode()); data=b""
+                    while True:
+                        part=sock.recv(2048)
+                        if not part: break
+                        data+=part
+            txt = data.decode(errors="ignore")
+            code_line = txt.splitlines()[0] if txt.splitlines() else ""
+            findings["admin_paths"][path_req] = {"status_line": code_line, "snippet": "\n".join(txt.splitlines()[1:11])}
+        except Exception as e:
+            findings["admin_paths"][path_req] = {"status_line": None, "error": str(e)}
+    return findings
+
+# ---------- Scan orchestration ----------
+def scan_host_ports(host, ports, threads=DEFAULT_THREADS):
+    results=[]
+    print(f"\n[*] Scanning {host} {len(ports)} ports (threads={threads})")
+    with ThreadPoolExecutor(max_workers=threads) as pool:
+        futures={pool.submit(probe_port, host, p): p for p in ports}
+        for fut in as_completed(futures):
+            r=fut.result(); results.append(r)
+            if r["open"]:
+                print(f"[+] {host}:{r['port']} OPEN (took {r['time']:.2f}s) service={r['service']}")
+                if r["banner"]:
+                    b=r["banner"]; print("    banner:", (b[:400]+"...") if len(b)>400 else b)
+                if r["probe"]:
+                    lines=str(r["probe"]).splitlines(); print("    probe snippet:")
+                    for ln in lines[:6]: print("      ", ln)
+                if r["tls"]:
+                    if r["tls"].get("ok"):
+                        cert=r["tls"]["cert"]; print("    TLS CN:", cert.get("commonName"), "SANs:", cert.get("SANs"), "days_left:", cert.get("days_until_expiry"))
+                    else:
+                        print("    TLS inspect error:", r["tls"].get("error"))
+    return results
+
+# ---------- Simple NVD lookup (best-effort) ----------
+def nvd_query_simple(keyword, api_key=None, max_results=5):
+    if not REQUESTS_OK: return None, "requests not installed"
+    base="https://services.nvd.nist.gov/rest/json/cves/2.0"
+    params={"keywordSearch": keyword, "resultsPerPage": str(max_results)}
+    headers={}
+    if api_key: headers["apiKey"]=api_key
+    try:
+        r=requests.get(base, params=params, headers=headers, timeout=10)
+        if r.status_code==200:
+            data=r.json(); hits=[]
+            for item in data.get("vulnerabilities", [])[:max_results]:
+                c=item.get("cve"); 
+                if not c: continue
+                cid=c.get("id"); descs=c.get("descriptions",[]); desc=descs[0].get("value") if descs else ""
+                hits.append({"cve":cid, "desc":desc})
+            return hits, None
+        else:
+            return None, f"NVD status {r.status_code}"
+    except Exception as e:
+        return None, str(e)
+
+# ---------- Passive non-destructive vuln triage ----------
+def passive_vuln_checks(entry):
+    text = (entry.get("banner") or "") + "\n" + (entry.get("probe") or "")
+    checks = {}
+    port = entry.get("port")
+    if port == 21 or "ftp" in text.lower():
+        checks["ftp_banner"] = entry.get("banner") or ""
+        if "anonymous" in (entry.get("banner") or "").lower():
+            checks["anonymous_ftp_possible"] = True
+    if entry.get("service")=="http" or port in (80,8080,8000,443,8443):
+        checks["http_possible"] = True
+    if port in (3306,5432,1433,1521,33060):
+        checks["db_exposed"] = True
+    if port in (135,139,445):
+        checks["smb_exposed"] = True
+    if "ssh" in text.lower() or port==22:
+        checks["ssh_banner"] = entry.get("banner") or ""
+    return checks
+
+# ---------- Save reports ----------
+def save_reports(prefix, data):
+    ts = now_str(); safe = prefix.replace(":", "_").replace("/", "_").replace(".", "_")
+    jname=f"recon_{safe}_{ts}.json"; cname=f"recon_{safe}_{ts}.csv"
+    with open(jname,"w",encoding="utf-8") as f: json.dump(data,f,indent=2)
+    with open(cname,"w",newline="",encoding="utf-8") as f:
+        writer=csv.writer(f)
+        writer.writerow(["host","port","open","service","banner","probe","tls_cn","tls_sans","tls_days_left","scan_time","error"])
+        for r in data:
+            tls=r.get("tls") or {}; cert=tls.get("cert") if tls else None
+            writer.writerow([r.get("host"), r.get("port"), r.get("open"), r.get("service"),
+                             (r.get("banner") or "").replace("\n","\\n")[:800],
+                             (r.get("probe") or "").replace("\n","\\n")[:800] if isinstance(r.get("probe"),str) else str(r.get("probe"))[:800],
+                             (cert.get("commonName") if cert else "") if cert else "",
+                             (",".join(cert.get("SANs")) if cert and cert.get("SANs") else "") if cert else "",
+                             (cert.get("days_until_expiry") if cert else ""), f"{r.get('time'):.3f}", (r.get("error") or "")])
+    print(f"\nSaved JSON => {jname}"); print(f"Saved CSV  => {cname}")
+
+# ---------- CLI / Config helpers ----------
+def load_config_file(path):
+    try:
+        with open(path,"r",encoding="utf-8") as f: return json.load(f)
+    except Exception as e:
+        print("Failed to load config:", e); return None
+
+def parse_runner_args():
+    p=argparse.ArgumentParser(description="recon_final_ready non-interactive")
+    p.add_argument("--config", help="Path to JSON config file", default=None)
+    p.add_argument("--target", help="Single target IP/hostname or comma list", default=None)
+    p.add_argument("--ports", help="Ports (e.g. 22,80 or 1-1024)", default=None)
+    p.add_argument("--sweep", help="Sweep probe ports (comma list) e.g. 80,443", default=None)
+    p.add_argument("--threads", help="Threads for scanning", type=int, default=None)
+    p.add_argument("--nvdkey", help="Optional NVD API key", default=None)
+    p.add_argument("--yes", help="Auto-confirm steps (non-interactive)", action="store_true")
+    args=p.parse_args()
+    if args.config:
+        cfg=load_config_file(args.config)
+        if not cfg: sys.exit(1)
+        return {"mode":"config","targets":cfg.get("targets") or cfg.get("target") or [], "sweep_ports":cfg.get("sweep_ports") or cfg.get("sweep") or COMMON_SWEEP_PORTS, "scan_ports":cfg.get("scan_ports") or cfg.get("ports") or "1-1024", "threads":cfg.get("threads") or DEFAULT_THREADS, "nvd_key":cfg.get("nvd_key") or None, "auto_confirm":cfg.get("auto_confirm") or args.yes}
+    if args.target:
+        return {"mode":"cli","targets":[t.strip() for t in args.target.split(",") if t.strip()],"sweep_ports":parse_port_input(args.sweep) if args.sweep else COMMON_SWEEP_PORTS,"scan_ports":args.ports or "1-1024","threads":args.threads or DEFAULT_THREADS,"nvd_key":args.nvdkey or None,"auto_confirm":args.yes}
+    return None
+
+# ---------- Main ----------
+def main():
+    print("recon_final_ready - recon, HTTP enum, safe vuln triage (prompts before each stage)")
+    print("LEGAL: Only run on systems you own or have explicit permission to test.\n")
+
+    run_opts = parse_runner_args()
+    if run_opts:
+        targets=[]
+        for t in run_opts["targets"]:
+            if t.endswith("."):
+                for i in range(1,255): targets.append(f"{t}{i}")
+            else: targets.append(t)
+        sweep_ports = run_opts["sweep_ports"]
+        ports = parse_port_input(run_opts["scan_ports"])
+        threads = run_opts["threads"]
+        nvd_key = run_opts["nvd_key"]
+        auto_confirm = bool(run_opts.get("auto_confirm"))
+        print("Non-interactive mode: targets=", targets)
+    else:
+        targets_raw = input("Enter target (single IP/hostname, comma list, or subnet base e.g. '192.168.1.'): ").strip()
+        targets = parse_host_input(targets_raw)
+        if not targets: print("No valid hosts. Exiting."); return
+        sweep_choice = input("Run host discovery sweep first? (y/n) [y]: ").strip().lower() or "y"
+        use_sweep = sweep_choice.startswith("y")
+        if use_sweep:
+            p_in = input(f"Ports to probe for host discovery (comma list, default {COMMON_SWEEP_PORTS}): ").strip()
+            sweep_ports = parse_port_input(p_in) if p_in else COMMON_SWEEP_PORTS
+            th_in = input(f"Threads for sweep (default {DEFAULT_THREADS}): ").strip()
+            try: threads = max(1,int(th_in)) if th_in else DEFAULT_THREADS
+            except: threads = DEFAULT_THREADS
+            auto_confirm=False
+        else:
+            sweep_ports=None; threads=DEFAULT_THREADS; auto_confirm=False
+        p_range_in = input("Enter port(s) to scan (single '22', list '22,80', range '1-1024') [1-1024]: ").strip() or "1-1024"
+        ports = parse_port_input(p_range_in)
+        if not ports: print("Invalid ports. Exiting."); return
+        th_in2 = input(f"Threads for port scan (default {DEFAULT_THREADS}): ").strip()
+        try: threads = max(1,int(th_in2)) if th_in2 else threads
+        except: pass
+        if REQUESTS_OK:
+            nvd_key = input("Optional NVD API key (press Enter to skip): ").strip() or None
+        else:
+            nvd_key = None; print("Note: 'requests' not available; NVD lookups will be skipped.")
+        use_sweep = use_sweep if 'use_sweep' in locals() else True
+
+    def confirm_or_auto(prompt, auto):
+        if auto:
+            print(f"[AUTO] {prompt} -> proceeding"); return True
+        ans = input(prompt + " (y/n): ").strip().lower(); return ans.startswith("y")
+
+    live_hosts = targets
+    if 'sweep_ports' in locals() and sweep_ports:
+        ok = confirm_or_auto(f"About to run host discovery on {len(targets)} target(s) using ports {sweep_ports}. Proceed?", auto_confirm if run_opts else False)
+        if not ok:
+            print("Host discovery skipped by user."); live_hosts=targets
+        else:
+            live_hosts = tcp_sweep(targets, probe_ports=sweep_ports, threads=threads)
+            if not live_hosts:
+                print("No live hosts found by sweep. Exiting."); return
+
+    ok = confirm_or_auto(f"About to scan ports {min(ports)}..{max(ports)} on {len(live_hosts)} host(s). Proceed?", auto_confirm if run_opts else False)
+    if not ok:
+        print("Port scanning skipped by user. Exiting."); return
+
+    overall_results=[]
+    for h in live_hosts:
+        res=scan_host_ports(h, ports, threads=threads); overall_results.extend(res)
+
+    findings = [r for r in overall_results if r.get("open")]
+    if not findings:
+        print("No open ports found. Exiting.")
+        if SAVE_REPORTS:
+            if confirm_or_auto("Save empty report?", auto_confirm if run_opts else False): save_reports("_".join(targets), overall_results)
+        return
+
+    ok = confirm_or_auto(f"Found {len(findings)} open ports. Would you like to run automated CVE lookups (NVD) / prepare search URLs? This will use network requests.", auto_confirm if run_opts else False)
+    if ok:
+        for f in findings:
+            text=(f.get("banner") or "") + "\n" + (f.get("probe") or "")
+            prod=""
+            if "openssh" in text.lower() or "ssh-" in text.lower(): prod="OpenSSH"
+            elif "apache" in text.lower(): prod="Apache"
+            elif "nginx" in text.lower(): prod="nginx"
+            elif "vsftpd" in text.lower(): prod="vsftpd"
+            elif "mysql" in text.lower(): prod="MySQL"
+            f["cve_hits"]=None; f["cve_error"]=None; f["cve_search_urls"]=None
+            if prod:
+                ver=""; m=re.search(r"(?i)"+re.escape(prod)+r"[/ _-]?([\d\.p]+)", text)
+                if m: ver=m.group(1)
+                q=f"{prod} {ver}".strip()
+                if q and nvd_key:
+                    if REQUESTS_OK:
+                        hits, err = nvd_query_simple(q, api_key=nvd_key)
+                        if hits is not None: f["cve_hits"]=hits
+                        else: f["cve_error"]=err
+                    else:
+                        f["cve_error"]="requests not installed"
+                else:
+                    safeq = q.replace(" ", "+")
+                    f["cve_search_urls"]=[f"https://nvd.nist.gov/vuln/search/results?query={safeq}&form_type=Basic", f"https://www.google.com/search?q={safeq}+CVE"]
+        print("Automated CVE lookup step completed (or search URLs prepared).")
+    else:
+        print("Skipped automated CVE lookup.")
+
+    http_ports = [r for r in findings if r.get("open") and (r.get("service")=="http" or r.get("port") in (80,8080,8000,443,8443))]
+    if http_ports:
+        ok = confirm_or_auto(f"HTTP enumeration will run against {len(http_ports)} HTTP(S) services (fetch /, robots.txt, common admin paths). Proceed?", auto_confirm if run_opts else False)
+        if ok:
+            print("\n[*] Running HTTP enumeration (non-intrusive)...")
+            http_findings = []
+            for h in http_ports:
+                host=h.get("host"); port=h.get("port"); tls=h.get("tls")
+                try:
+                    ef = enumerate_http_service(host, port, tls_info=tls.get("cert") if isinstance(tls,dict) else None)
+                    http_findings.append(ef)
+                    h["http_enum"]= {"root_status": ef.get("root_status"), "root_title": ef.get("root_title"), "server": ef.get("server_header"), "admin_paths": list(ef.get("admin_paths", {}).keys())}
+                    print(f"[+] HTTP enum {host}:{port}  title={ef.get('root_title') or 'N/A'}  server={ef.get('server_header') or 'N/A'}")
+                except Exception as e:
+                    print("HTTP enum error for", host, port, e)
+            for r in overall_results:
+                if r.get("open") and r.get("port") in (80,8080,8000,443,8443):
+                    for ef in http_findings:
+                        if ef["host"]==r["host"] and ef["port"]==r["port"]:
+                            r["http_enum_detail"]=ef; break
+        else:
+            print("Skipped HTTP enumeration.")
+
+    ok = confirm_or_auto("Run passive non-destructive vulnerability checks (detect anonymous FTP hints, exposed DB/SMB, SSH banners)?", auto_confirm if run_opts else False)
+    if ok:
+        for f in findings:
+            f["passive_checks"] = passive_vuln_checks(f)
+        print("Passive checks done. No logins/brute force were attempted.")
+    else:
+        print("Skipped passive vulnerability checks.")
+
+    if SAVE_REPORTS:
+        ok = confirm_or_auto("Save JSON + CSV reports for this run?", auto_confirm if run_opts else False)
+        if ok: save_reports("_".join(targets), overall_results)
+        else: print("Skipped saving reports.")
+
+    print("\n=== Summary of open ports & findings ===")
+    for r in overall_results:
+        if r.get("open"):
+            print(f" - {r['host']}:{r['port']}  service={r.get('service')}  time={r.get('time'):.2f}s")
+            if r.get("banner"): print("    banner:", (r['banner'][:200]+"...") if len(r['banner'])>200 else r['banner'])
+            if r.get("http_enum_detail"):
+                he = r["http_enum_detail"]
+                print("    HTTP title:", he.get("root_title"), " Server:", he.get("server_header"))
+                admins = he.get("admin_paths") or []
+                if admins: print("    admin paths (seen):", ", ".join(admins))
+            if r.get("cve_hits"):
+                for c in r["cve_hits"][:3]: print("    CVE:", c.get("cve"), "-", (c.get("desc") or "")[:140])
+            if r.get("cve_search_urls"):
+                for u in r["cve_search_urls"][:2]: print("    SearchURL:", u)
+            if r.get("passive_checks"):
+                pc=r["passive_checks"]
+                if pc.get("anonymous_ftp_possible"): print("    Passive: anonymous FTP banner detected (check anonymous settings).")
+                if pc.get("db_exposed"): print("    Passive: DB port exposed (review firewall/VPN).")
+                if pc.get("smb_exposed"): print("    Passive: SMB port exposed (high risk on WAN).")
+    print("\nDone. Only perform in-scope, authorized testing.")
+
+if __name__ == "__main__":
+    main()
+    
